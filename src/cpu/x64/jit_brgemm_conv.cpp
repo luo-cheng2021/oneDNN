@@ -22,6 +22,7 @@
 #include "cpu/x64/injectors/jit_uni_binary_injector.hpp"
 
 #include "cpu/x64/jit_brgemm_conv.hpp"
+#include <xmmintrin.h>
 
 namespace dnnl {
 namespace impl {
@@ -860,6 +861,12 @@ status_t brgemm_convolution_fwd_t<isa, use_inversion>::execute(
 
     parallel(jcp.nthr, [&](const int ithr, const int nthr) {
         if (ithr >= work_amount) return;
+        unsigned int DENORMALS_ZERO = 0x0040;
+        unsigned int FLUSH_ZERO = 0x8000;
+        unsigned int csr = _mm_getcsr();
+        csr |= DENORMALS_ZERO;
+        csr |= FLUSH_ZERO;
+        _mm_setcsr(csr);
 
         brgemm_batch_element_t *const __restrict brg_batch = brg_batch_global
                 + static_cast<size_t>(ithr) * jcp.adjusted_batch_size;
