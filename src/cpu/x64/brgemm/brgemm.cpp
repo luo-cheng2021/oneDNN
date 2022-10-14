@@ -190,6 +190,7 @@ status_t brgemm_blocking(brgemm_t *brg) {
                 best_bd_block_eff = bd_block_eff;
             }
         }
+        brg->bd_block = 8;
         brg->bdb = brg->bcast_dim / brg->bd_block;
         brg->bdb_tail = brg->bcast_dim % brg->bd_block;
 

@@ -335,7 +335,7 @@ void jit_avx512_common_1x1_conv_kernel::reduce_loop(
                             && (i_load + 1 == load_loop_blk && mask_flag)) {
                         vreg_acc = vreg_acc | k_load_dim_mask;
                     }
-                    vmovups(output_ptr(out_layout_nxc, i_load, i_ur), vreg_acc);
+                    // vmovups(output_ptr(out_layout_nxc, i_load, i_ur), vreg_acc);
                 }
             }
         };

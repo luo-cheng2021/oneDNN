@@ -2068,7 +2068,7 @@ status_t init_1x1_conf(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     best_brgb.oc_block = min_oc_block;
     brg_blocking_t cur_brgb = zero<decltype(cur_brgb)>();
     cur_brgb.get_from_jcp(jcp);
-    auto start_ocb = 4;
+    auto start_ocb = 3;
     if (jcp.wei_plain)
         start_ocb = nstl::min(jcp.ic > 128 ? (jcp.ic > 256 ? 8 : 16) : 32,
                 div_up(jcp.oc, 16));
