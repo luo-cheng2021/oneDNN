@@ -1175,8 +1175,8 @@ void jit_brgemm_kernel_t::store_accumulators_without_post_ops(
             if (is_ld_tail)
                 vmovups(ptr[reg_aux_C + C_offset(bd, ld)] | ld_tail_mask | T_z,
                         zmm);
-            // else
-            //     vmovups(ptr[reg_aux_C + C_offset(bd, ld)], zmm);
+            else
+                vmovups(ptr[reg_aux_C + C_offset(bd, ld)], zmm);
         }
     }
 }
