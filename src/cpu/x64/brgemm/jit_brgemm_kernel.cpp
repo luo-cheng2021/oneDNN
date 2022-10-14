@@ -1546,7 +1546,14 @@ void jit_brgemm_kernel_t::gemm_microkernel_avx512(int bd_block2,
                     = maybe_load_bytes && (rd == rd_loop - brg.rd_step);
 
             auto rows_by_load_bytes = have_to_load_bytes ? rows_for_rd_tail : 0;
+            // prefetch 'C'
             auto p = std::getenv("USE_BRG");
+            if (1 && p && p[0] == '1' && rd == 3 && is_rd_last_col) {
+                for (int ld = 0; ld < ld_block2; ld++) {
+                    prefetcht1(ptr[reg_aux_C + C_offset(0, ld)]);
+                }
+                add(reg_aux_C, brg.typesize_C * brg.LDC);
+            }
             for (int bd = bd_b; bd < bd_e; bd++) {
                 if (!is_emdbd) {
                     const auto bd_by_load_bytes
@@ -1651,6 +1658,7 @@ void jit_brgemm_kernel_t::ldb_loop(int bd_block2, bool is_bdb_tail,
                     dec(reg_rdb_loop);
                     cmp(reg_rdb_loop, 0);
                     jg(rdb_loop_label_tail, T_NEAR);
+                    sub(reg_aux_C, brg.typesize_C * brg.bd_block * brg.LDC);
                 }
             }
         }
