@@ -63,8 +63,10 @@ typedef enum {
 } brgemm_kernel_loop_order_t;
 
 typedef enum {
-    brgemm_prf_default = 1,
+    brgemm_prf_default = 1, // default is prefetch b
     brgemm_prf_output1 = 2,
+    brgemm_prf_a = 4,
+    brgemm_prf_ac = 8
 } brgemm_kernel_prefetching_t;
 
 typedef enum {

@@ -2068,7 +2068,7 @@ status_t init_1x1_conf(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     best_brgb.oc_block = min_oc_block;
     brg_blocking_t cur_brgb = zero<decltype(cur_brgb)>();
     cur_brgb.get_from_jcp(jcp);
-    auto start_ocb = 3;
+    auto start_ocb = 4;
     if (jcp.wei_plain)
         start_ocb = nstl::min(jcp.ic > 128 ? (jcp.ic > 256 ? 8 : 16) : 32,
                 div_up(jcp.oc, 16));
@@ -2121,6 +2121,16 @@ status_t init_1x1_conf(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     jcp.use_uker = is_amx(isa);
     if (jcp.use_uker)
         jcp.hint_prefetching = brgemm_kernel_prefetching_t::brgemm_prf_output1;
+    else {
+        if (jcp.ic >= 16 * 8) {
+            jcp.hint_prefetching = brgemm_kernel_prefetching_t::brgemm_prf_ac;
+        }
+        auto p = std::getenv("USE_BRG");
+        if (p) {
+            jcp.hint_prefetching = p[0] == '1' ? brgemm_kernel_prefetching_t::brgemm_prf_ac:
+                brgemm_kernel_prefetching_t::brgemm_prf_default;
+        }
+    }
     CHECK(pick_tags(jcp, src_md, weights_md, dst_md, bias_md));
     CHECK(attr.set_default_formats(&dst_md));
 

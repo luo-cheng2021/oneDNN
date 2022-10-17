@@ -190,13 +190,14 @@ status_t brgemm_blocking(brgemm_t *brg) {
                 best_bd_block_eff = bd_block_eff;
             }
         }
-        brg->bd_block = 8;
         brg->bdb = brg->bcast_dim / brg->bd_block;
         brg->bdb_tail = brg->bcast_dim % brg->bd_block;
+        if (brg->brgattr.hint_prefetching == brgemm_kernel_prefetching_t::brgemm_prf_default) {
+            brg->rd_block = 16 / brg->typesize_A;
+        } else {
+            brg->rd_block = 16;
+        }
 
-        auto p = std::getenv("USE_BRG");
-        brg->rd_block = p && p[0] == '1' ? 16 : 16 / brg->typesize_A;
-        //brg->rd_block = 16 / brg->typesize_A;
         brg->rdb = brg->reduce_dim / brg->rd_block;
         brg->rdb_tail = brg->reduce_dim % brg->rd_block;
 
@@ -751,7 +752,10 @@ status_t brgemm_desc_set_attr(brgemm_t *brg, const brgemm_attr_t &brgattr) {
 
     brg->brgattr = brgattr;
 
-    if (brgattr.bd_mask_level) brgemm_blocking(brg);
+    if (brgattr.bd_mask_level
+        || brgattr.hint_prefetching
+                != brgemm_kernel_prefetching_t::brgemm_prf_default)
+        brgemm_blocking(brg);
 
     return status::success;
 }

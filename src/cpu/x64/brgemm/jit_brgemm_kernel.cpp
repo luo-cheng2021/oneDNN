@@ -1501,6 +1501,7 @@ void jit_brgemm_kernel_t::gemm_microkernel_avx512(int bd_block2,
 
     bool maybe_load_bytes = (rows_for_rd_tail > 0 || brg.brgattr.wary_tail_read)
             && is_rd_tail && rd_tail_size != 0 && (brg.is_bf16 || brg.is_int8);
+    const int reduce_num_in_cache_lines = div_up(brg.reduce_dim * brg.typesize_A, 64);
     if (n_bcast_1_load) {
         for (int rd = 0; rd < rd_loop; rd += brg.rd_step) {
             bool have_to_load_bytes
@@ -1512,8 +1513,23 @@ void jit_brgemm_kernel_t::gemm_microkernel_avx512(int bd_block2,
                         || brg.brgattr.wary_tail_read);
                 broadcast(bcst(bd), A_offset(bd, rd),
                         have_to_load_bytes && bd_by_load_bytes);
+                // prefetch 'a'
+                if (brg.brgattr.hint_prefetching == brgemm_kernel_prefetching_t::brgemm_prf_ac && rd == 0) {
+                    if (is_rd_tail || is_rd_last_col) {
+                        prefetcht0(ptr[reg_aux_A + A_offset(bd, rd) +
+                            bdb_A_offset(bd_block2) - 64 * (reduce_num_in_cache_lines - prefetch_num)]);
+                    } else {
+                        prefetcht0(ptr[reg_aux_A + A_offset(bd, rd) + 64 * prefetch_num]);
+                    }
+                }
             }
+            bool need_prefetchc = brg.brgattr.hint_prefetching == brgemm_kernel_prefetching_t::brgemm_prf_ac && rd == 4 && (is_rd_last_col || is_rd_tail);
             for (int ld = 0; ld < ld_block2; ld++) {
+                // prefetch 'C'
+                if (need_prefetchc) {
+                    prefetcht1(ptr[reg_aux_C + C_offset(0, ld)]);
+                }
+
                 if (is_ld_tail) {
                     vmovups(load() | ld_tail_mask | T_z,
                             ptr[reg_aux_B + B_offset(ld, rd)]);
@@ -1529,6 +1545,10 @@ void jit_brgemm_kernel_t::gemm_microkernel_avx512(int bd_block2,
                         dot_product(zmm, load(), bcst(bd));
                 }
             }
+            // prefetch 'C'
+            if (need_prefetchc) {
+                add(reg_aux_C, brg.typesize_C * brg.LDC);
+            }            
         }
     } else {
         for (int rd = 0; rd < rd_loop; rd += brg.rd_step) {
@@ -1547,8 +1567,7 @@ void jit_brgemm_kernel_t::gemm_microkernel_avx512(int bd_block2,
 
             auto rows_by_load_bytes = have_to_load_bytes ? rows_for_rd_tail : 0;
             // prefetch 'C'
-            auto p = std::getenv("USE_BRG");
-            if (1 && p && p[0] == '1' && rd == 3 && is_rd_last_col) {
+            if (brg.brgattr.hint_prefetching == brgemm_kernel_prefetching_t::brgemm_prf_ac && rd == 4 && (is_rd_last_col || is_rd_tail)) {
                 for (int ld = 0; ld < ld_block2; ld++) {
                     prefetcht1(ptr[reg_aux_C + C_offset(0, ld)]);
                 }
@@ -1561,19 +1580,18 @@ void jit_brgemm_kernel_t::gemm_microkernel_avx512(int bd_block2,
                                     || brg.brgattr.wary_tail_read);
                     broadcast(bcst(), A_offset(bd, rd),
                             have_to_load_bytes && bd_by_load_bytes);
-                    if (1 && p && p[0] == '1' && rd == 0 && brg.reduce_dim > prefetch_num * 16) {
-                        //int3();
+                    if (brg.brgattr.hint_prefetching == brgemm_kernel_prefetching_t::brgemm_prf_ac && rd == 0) {
                         if (is_rd_tail || is_rd_last_col) {
                             prefetcht0(ptr[reg_aux_A + A_offset(bd, rd) +
-                                bdb_A_offset(bd_block2) - 64 * ((brg.reduce_dim + 15) / 16 - prefetch_num)]);
+                                bdb_A_offset(bd_block2) - 64 * (reduce_num_in_cache_lines - prefetch_num)]);
                         } else {
                             prefetcht0(ptr[reg_aux_A + A_offset(bd, rd) + 64 * prefetch_num]);
                         }
                     }
                 }
-                if (prefetch_count_B < ld_block2) {
-                    // prefetcht0(ptr[reg_aux_B + B_offset(prefetch_count_B++, rd)
-                    //         + brg.LDB * brg.rd_block * brg.typesize_B]);
+                if (brg.brgattr.hint_prefetching == brgemm_kernel_prefetching_t::brgemm_prf_default && prefetch_count_B < ld_block2) {
+                    prefetcht0(ptr[reg_aux_B + B_offset(prefetch_count_B++, rd)
+                            + brg.LDB * brg.rd_block * brg.typesize_B]);
                 }
                 for (int ld = 0; ld < ld_block2; ld++) {
                     auto zmm = accm(ld_block2, bd, ld);
@@ -1606,7 +1624,8 @@ void jit_brgemm_kernel_t::ldb_loop(int bd_block2, bool is_bdb_tail,
         const auto bd_e = nstl::min(bd_block, bd_block + vpad);
         if (bd_b >= bd_e) return;
 
-        int prefetch_num = 8;
+        const int reduce_num_in_cache_lines = div_up(brg.reduce_dim * brg.typesize_A, 64);
+        int prefetch_num = std::min(8, reduce_num_in_cache_lines);
         auto n = std::getenv("USE_P");
         if (n) prefetch_num = n[0] - '0';
 
@@ -1618,37 +1637,43 @@ void jit_brgemm_kernel_t::ldb_loop(int bd_block2, bool is_bdb_tail,
             if (brg.rdb > 0) {
                 Label rdb_loop_label;
                 Label rdb_loop_label_tail;
-                auto p = std::getenv("USE_BRG");
-                if (p && p[0] == '1' && brg.reduce_dim > prefetch_num * 16) {
-                    mov(reg_rdb_loop, brg.rdb - 16 / brg.rd_block * (prefetch_num - (brg.rdb_tail != 0)));
+                if (brg.brgattr.hint_prefetching == brgemm_kernel_prefetching_t::brgemm_prf_ac) {
+                    if (brg.rdb > (prefetch_num - (brg.rdb_tail != 0))) {
+                        mov(reg_rdb_loop, brg.rdb - (prefetch_num - (brg.rdb_tail != 0)));
+                        L_aligned(rdb_loop_label, 64);
+                        {
+                            const bool is_rd_tail = false;
+                            gemm_microkernel_avx512(bd_block2, is_bdb_tail, ld_block2,
+                                    is_rd_tail, is_ld_tail, vpad, rows_for_rd_tail, false, prefetch_num);
+
+                            add(reg_aux_A, rdb_A_offset());
+                            add(reg_aux_B, rdb_B_offset());
+
+                            dec(reg_rdb_loop);
+                            cmp(reg_rdb_loop, 0);
+                        }
+                        jg(rdb_loop_label, T_NEAR);
+                    }
                 } else {
                     mov(reg_rdb_loop, brg.rdb);
-                }                
-                L_aligned(rdb_loop_label, 64);
-                {
-                    const bool is_rd_tail = false;
-                    gemm_microkernel_avx512(bd_block2, is_bdb_tail, ld_block2,
-                            is_rd_tail, is_ld_tail, vpad, rows_for_rd_tail, false, prefetch_num);
+                    L_aligned(rdb_loop_label, 64);
+                    {
+                        const bool is_rd_tail = false;
+                        gemm_microkernel_avx512(bd_block2, is_bdb_tail, ld_block2,
+                                is_rd_tail, is_ld_tail, vpad, rows_for_rd_tail, false, prefetch_num);
 
-                    add(reg_aux_A, rdb_A_offset());
-                    add(reg_aux_B, rdb_B_offset());
+                        add(reg_aux_A, rdb_A_offset());
+                        add(reg_aux_B, rdb_B_offset());
 
-                    dec(reg_rdb_loop);
-                    cmp(reg_rdb_loop, 0);
+                        dec(reg_rdb_loop);
+                        cmp(reg_rdb_loop, 0);
+                    }
+                    jg(rdb_loop_label, T_NEAR);
                 }
-                jg(rdb_loop_label, T_NEAR);
-                if (p && p[0] == '1' && brg.reduce_dim > prefetch_num * 16) {
-                    // prefetch C matrix
-                    // int bd_block = (is_bdb_tail) ? brg.bdb_tail : brg.bd_block;
-                    // const auto bd_b = nstl::max(0, vpad);
-                    // const auto bd_e = nstl::min(bd_block, bd_block + vpad);
-                    // for (int bd = bd_b; bd < bd_e; bd++)
-                    //     for (int ld = 0; ld < ld_block2; ld++) {
-                    //     //prefetcht0(ptr[reg_aux_A + A_offset(bd, rd) + 64 * prefetch_num]);
-                    //         prefetcht1(ptr[reg_aux_C + C_offset(bd, ld)]);
-                    // }
+                if (brg.brgattr.hint_prefetching == brgemm_kernel_prefetching_t::brgemm_prf_ac) {
                     const bool is_rd_tail = false;
-                    mov(reg_rdb_loop, 16 / brg.rd_block * (prefetch_num - (brg.rdb_tail != 0)));
+                    mov(reg_rdb_loop, prefetch_num - (brg.rdb_tail != 0));
+                    push(reg_aux_C);
                     L_aligned(rdb_loop_label_tail, 64);
                     gemm_microkernel_avx512(bd_block2, is_bdb_tail, ld_block2,
                             is_rd_tail, is_ld_tail, vpad, rows_for_rd_tail, true, prefetch_num);
@@ -1658,7 +1683,8 @@ void jit_brgemm_kernel_t::ldb_loop(int bd_block2, bool is_bdb_tail,
                     dec(reg_rdb_loop);
                     cmp(reg_rdb_loop, 0);
                     jg(rdb_loop_label_tail, T_NEAR);
-                    sub(reg_aux_C, brg.typesize_C * brg.bd_block * brg.LDC);
+                    if (brg.rdb_tail == 0)
+                        pop(reg_aux_C);
                 }
             }
         }
@@ -1670,6 +1696,8 @@ void jit_brgemm_kernel_t::ldb_loop(int bd_block2, bool is_bdb_tail,
             } else {
                 gemm_microkernel_avx512(bd_block2, is_bdb_tail, ld_block2,
                         is_rd_tail, is_ld_tail, vpad, rows_for_rd_tail, false, prefetch_num);
+                if (brg.brgattr.hint_prefetching == brgemm_kernel_prefetching_t::brgemm_prf_ac)
+                    pop(reg_aux_C);
             }
         }
     };
