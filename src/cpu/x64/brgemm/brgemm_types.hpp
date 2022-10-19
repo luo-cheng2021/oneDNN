@@ -198,6 +198,7 @@ struct brgemm_t {
     static constexpr int MAX_VPAD = 100;
 
     int is_M_tail;
+    bool no_N_tail = false;  // handle N tail use mask, not seperate it to additional loop
     // Tile register decomposition
     int get_ld_block2() const noexcept {
         return (ldb_tail) ? ld_block2 + 1 : ld_block2;

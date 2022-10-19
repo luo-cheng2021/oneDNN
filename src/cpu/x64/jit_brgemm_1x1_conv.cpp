@@ -73,8 +73,14 @@ status_t brgemm_1x1_convolution_fwd_t<isa>::pd_t::init(engine_t *engine) {
     CHECK(brgemm_convolution_utils::init_1x1_conf(jcp_, isa, *desc(), src_md_,
             weights_md_, dst_md_, bias_md_, attr_, dnnl_get_max_threads()));
 
-    for (int i = 0; i < 16; i++)
+    auto pe = std::getenv("USE_BRG");
+    for (int i = 0; i < 16; i++) {
         brgs_[i].bcast_dim = brgs_[i].load_dim = brgs_[i].reduce_dim = 0;
+        brgs_[i].no_N_tail = true;
+        if (pe) {
+            brgs_[i].no_N_tail = pe[0] == '1';
+        }
+    }
 
     const float alpha = 1.0;
     const float beta = 1.0;

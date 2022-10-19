@@ -143,8 +143,13 @@ namespace {
 status_t brgemm_blocking(brgemm_t *brg) {
     if (!brg->is_int8_amx && !brg->is_bf16_amx) {
         brg->ld_block = 16;
-        brg->ldb = brg->load_dim / brg->ld_block;
-        brg->ldb_tail = brg->load_dim % brg->ld_block;
+        if (brg->no_N_tail == false) {
+            brg->ldb = brg->load_dim / brg->ld_block;
+            brg->ldb_tail = brg->load_dim % brg->ld_block;
+        } else {
+            brg->ldb = (brg->load_dim + brg->ld_block - 1) / brg->ld_block;
+            brg->ldb_tail = 0;
+        }
 
         brg->ld_block2 = 4; // (M < 9) ? 2 : 4 | TODO - fix this for INT8
         brg->ldb2 = brg->ldb / brg->ld_block2;
