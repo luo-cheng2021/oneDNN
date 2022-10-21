@@ -290,7 +290,7 @@ private:
     void set_A_B_matrices();
 
     void gemm_microkernel_avx512(int bd_block2, bool is_bdb_tail, int ld_block,
-            bool is_rd_tail, bool is_ld_tail, int vpad, int rows_for_rd_tail);
+            bool is_rd_tail, bool is_ld_tail, int vpad, int rows_for_rd_tail, bool is_rd_last_col = false, int prefetch_num = 0);
     void gemm_microkernel_amx(int bd_block2, bool is_bdb_tail, int ld_block,
             bool is_rd_tail, bool is_ld_tail);
 
@@ -334,6 +334,8 @@ private:
     int zp_comp_b_offset(int bd) const noexcept;
     int bdb_zp_comp_b_offset(int bd_block2) const noexcept;
     int zp_c_values_offset(int ld, bool is_tail = false) const noexcept;
+
+    bool is_n_block_tail(int ld, int ld_block2) const noexcept;
 
     bool n_bcast_1_load = false;
     bool vpad_exist = false;
@@ -447,6 +449,10 @@ int jit_brgemm_kernel_t::zp_comp_b_offset(int bd) const noexcept {
 
 int jit_brgemm_kernel_t::bdb_zp_comp_b_offset(int bd_block2) const noexcept {
     return zp_comp_b_offset(bd_block2 * brg.bd_block);
+}
+
+bool jit_brgemm_kernel_t::is_n_block_tail(int ld, int ld_block2) const noexcept {
+    return brg.no_N_tail && brg.load_dim % brg.ld_block && ld == ld_block2 - 1;
 }
 
 int jit_brgemm_kernel_t::zp_c_values_offset(int ld, bool is_tail) const
@@ -876,14 +882,15 @@ void jit_brgemm_kernel_t::apply_alpha_beta(
         if (apply_alpha) vmulps(zmm, zmm, zmm_alpha);
         if (apply_beta) {
             auto ptr_C = ptr[reg_aux_C + C_offset(bd, ld)];
+            auto k_mask_no_N_tail = is_n_block_tail(ld, ld_block2) ? ld_tail_mask : k_mask;
             if (use_vadd_for_beta) {
-                auto zmm_masked = zmm | k_mask | T_z;
+                auto zmm_masked = zmm | k_mask_no_N_tail | T_z;
                 if (brg.is_int8)
                     vpaddd(zmm_masked, zmm, ptr_C);
                 else
                     vaddps(zmm_masked, zmm, ptr_C);
             } else {
-                cvt2ps(brg.dt_c, zmm_prev_dst, ptr_C, true, false, k_mask);
+                cvt2ps(brg.dt_c, zmm_prev_dst, ptr_C, true, false, k_mask_no_N_tail);
                 vfmadd231ps(zmm, zmm_prev_dst, zmm_beta);
             }
         }
@@ -909,7 +916,7 @@ void jit_brgemm_kernel_t::apply_post_ops(
                 rhs_arg_params.vmm_idx_to_out_reg.emplace(zmm_idx, reg_aux_D);
                 rhs_arg_params.vmm_idx_to_out_elem_off_val.emplace(
                         zmm_idx, D_offset(bd, ld));
-                if (is_ld_tail) rhs_arg_params.vmm_tail_idx_.emplace(zmm_idx);
+                if (is_ld_tail || is_n_block_tail(ld, ld_block2)) rhs_arg_params.vmm_tail_idx_.emplace(zmm_idx);
             }
         }
     }
@@ -945,7 +952,7 @@ void jit_brgemm_kernel_t::apply_post_ops(
                     const auto zmm = accm(ld_block2, bd, ld);
                     const auto addr = ptr[reg_aux_D + D_offset(bd, ld)];
                     const auto zmm_prev_dst = Xbyak::Zmm(0);
-                    cvt2ps(brg.sum_dt, zmm_prev_dst, addr, true, false, k_mask);
+                    cvt2ps(brg.sum_dt, zmm_prev_dst, addr, true, false, is_n_block_tail(ld, ld_block2) ? ld_tail_mask : k_mask);
                     if (p_sum_zp_reg_set) vsubps(zmm_prev_dst, zmm_sum_zp);
                     if (!p_sum_scale_reg_set)
                         vaddps(zmm, zmm_prev_dst);
@@ -986,7 +993,7 @@ void jit_brgemm_kernel_t::store_accumulators_apply_post_ops(
         if (brg.with_bias) {
             auto zmm_bias = zmm_tmp_1();
             auto ptr_bias = ptr[reg_aux_bias + bias_offset(ld)];
-            cvt2ps(brg.dt_bias, zmm_bias, ptr_bias, true, false, k_mask);
+            cvt2ps(brg.dt_bias, zmm_bias, ptr_bias, true, false, is_n_block_tail(ld, ld_block2) ? ld_tail_mask : k_mask);
             vaddps(zmm, zmm, zmm_bias);
         }
     }
@@ -996,7 +1003,7 @@ void jit_brgemm_kernel_t::store_accumulators_apply_post_ops(
         for (int bd = 0; bd < bd_block; bd++) {
             for (int ld = 0; ld < ld_block2; ld++) {
                 const Xbyak::Zmm zmm = zmm_mask(
-                        accm(ld_block2, bd, ld), true, false, k_mask);
+                        accm(ld_block2, bd, ld), true, false, is_n_block_tail(ld, ld_block2) ? ld_tail_mask : k_mask);
                 vmulps(zmm, zmm, ptr[reg_aux_scales + scales_offset(ld)]);
             }
         }
@@ -1018,7 +1025,7 @@ void jit_brgemm_kernel_t::store_accumulators_apply_post_ops(
                 auto zp_c_addr
                         = EVEX_compress_addr(reg_aux_zp_c_values, zp_c_off);
                 cvt2ps(data_type::s32, zmm_zp_c, zp_c_addr, true, false,
-                        k_mask);
+                        is_n_block_tail(ld, ld_block2) ? ld_tail_mask : k_mask);
             }
             for (int bd = 0; bd < bd_block; bd++) {
                 auto zmm = accm(ld_block2, bd, ld);
@@ -1050,8 +1057,8 @@ void jit_brgemm_kernel_t::store_accumulators_apply_post_ops(
             auto addr = ptr[reg_aux_D + D_offset(bd, ld)];
             auto zmm = accm(ld_block2, bd, ld);
             auto ymm = Xbyak::Ymm(zmm.getIdx());
-            const Xbyak::Zmm r_zmm = zmm_mask(zmm, true, true, k_mask);
-            const Xbyak::Ymm r_ymm = ymm_mask(ymm, true, true, k_mask);
+            const Xbyak::Zmm r_zmm = zmm_mask(zmm, true, true, is_n_block_tail(ld, ld_block2) ? ld_tail_mask : k_mask);
+            const Xbyak::Ymm r_ymm = ymm_mask(ymm, true, true, is_n_block_tail(ld, ld_block2) ? ld_tail_mask : k_mask);
             switch (brg.dt_d) {
                 case data_type::f32:
                 case data_type::s32: vmovups(addr, r_zmm); break;
@@ -1090,7 +1097,7 @@ void jit_brgemm_kernel_t::apply_compensation(
             auto zp_comp_a_addr
                     = EVEX_compress_addr(reg_aux_zp_comp_a, zp_comp_a_off);
             // apply src zero points value to the accumulated values
-            zmm_zp_comp_a = zmm_mask(zmm_zp_comp_a, true, false, k_mask);
+            zmm_zp_comp_a = zmm_mask(zmm_zp_comp_a, true, false, is_n_block_tail(ld, ld_block2) ? ld_tail_mask : k_mask);
             vmovups(zmm_zp_comp_a, zp_comp_a_addr);
             vpmulld(zmm_zp_comp_a, zmm_zp_comp_a, zmm_zp_a_val);
 
@@ -1128,7 +1135,7 @@ void jit_brgemm_kernel_t::apply_compensation(
             int comp_offset = compensations_offset(ld);
             auto comp_addr
                     = EVEX_compress_addr(reg_aux_compensation, comp_offset);
-            zmm_comp = zmm_mask(zmm_comp, true, false, k_mask);
+            zmm_comp = zmm_mask(zmm_comp, true, false, is_n_block_tail(ld, ld_block2) ? ld_tail_mask : k_mask);
             vmovups(zmm_comp, comp_addr);
 
             for (int bd = 0; bd < bd_block; bd++) {
@@ -1172,7 +1179,7 @@ void jit_brgemm_kernel_t::store_accumulators_without_post_ops(
         }
         for (int ld = 0; ld < ld_block2; ld++) {
             auto zmm = accm(ld_block2, bd, ld);
-            if (is_ld_tail)
+            if (is_ld_tail || is_n_block_tail(ld, ld_block2))
                 vmovups(ptr[reg_aux_C + C_offset(bd, ld)] | ld_tail_mask | T_z,
                         zmm);
             else
@@ -1452,7 +1459,7 @@ void jit_brgemm_kernel_t::gemm_microkernel_amx(int bd_block2, bool is_bdb_tail,
 
 void jit_brgemm_kernel_t::gemm_microkernel_avx512(int bd_block2,
         bool is_bdb_tail, int ld_block2, bool is_rd_tail, bool is_ld_tail,
-        int vpad, int rows_for_rd_tail) {
+        int vpad, int rows_for_rd_tail, bool is_rd_last_col, int prefetch_num) {
     MAYBE_UNUSED(bd_block2);
     auto dot_product = [=](Zmm z1, Zmm z2, Zmm z3) {
         if (brg.is_f32)
@@ -1501,6 +1508,7 @@ void jit_brgemm_kernel_t::gemm_microkernel_avx512(int bd_block2,
 
     bool maybe_load_bytes = (rows_for_rd_tail > 0 || brg.brgattr.wary_tail_read)
             && is_rd_tail && rd_tail_size != 0 && (brg.is_bf16 || brg.is_int8);
+    const int reduce_num_in_cache_lines = div_up(brg.reduce_dim * brg.typesize_A, 64);
     if (n_bcast_1_load) {
         for (int rd = 0; rd < rd_loop; rd += brg.rd_step) {
             bool have_to_load_bytes
@@ -1512,8 +1520,23 @@ void jit_brgemm_kernel_t::gemm_microkernel_avx512(int bd_block2,
                         || brg.brgattr.wary_tail_read);
                 broadcast(bcst(bd), A_offset(bd, rd),
                         have_to_load_bytes && bd_by_load_bytes);
+                // prefetch 'a'
+                if (brg.brgattr.hint_prefetching == brgemm_kernel_prefetching_t::brgemm_prf_ac && rd == 0) {
+                    if (is_rd_tail || is_rd_last_col) {
+                        prefetcht0(ptr[reg_aux_A + A_offset(bd, rd) +
+                            bdb_A_offset(bd_block2) - 64 * (reduce_num_in_cache_lines - prefetch_num)]);
+                    } else {
+                        prefetcht0(ptr[reg_aux_A + A_offset(bd, rd) + 64 * prefetch_num]);
+                    }
+                }
             }
+            bool need_prefetchc = brg.brgattr.hint_prefetching == brgemm_kernel_prefetching_t::brgemm_prf_ac && rd == 4 && (is_rd_last_col || is_rd_tail);
             for (int ld = 0; ld < ld_block2; ld++) {
+                // prefetch 'C'
+                if (need_prefetchc) {
+                    prefetcht1(ptr[reg_aux_C + C_offset(0, ld)]);
+                }
+
                 if (is_ld_tail) {
                     vmovups(load() | ld_tail_mask | T_z,
                             ptr[reg_aux_B + B_offset(ld, rd)]);
@@ -1529,6 +1552,10 @@ void jit_brgemm_kernel_t::gemm_microkernel_avx512(int bd_block2,
                         dot_product(zmm, load(), bcst(bd));
                 }
             }
+            // prefetch 'C'
+            if (need_prefetchc) {
+                add(reg_aux_C, brg.typesize_C * brg.LDC);
+            }            
         }
     } else {
         for (int rd = 0; rd < rd_loop; rd += brg.rd_step) {
@@ -1546,6 +1573,13 @@ void jit_brgemm_kernel_t::gemm_microkernel_avx512(int bd_block2,
                     = maybe_load_bytes && (rd == rd_loop - brg.rd_step);
 
             auto rows_by_load_bytes = have_to_load_bytes ? rows_for_rd_tail : 0;
+            // prefetch 'C'
+            if (brg.brgattr.hint_prefetching == brgemm_kernel_prefetching_t::brgemm_prf_ac && rd == 4 && (is_rd_last_col || is_rd_tail)) {
+                for (int ld = 0; ld < ld_block2; ld++) {
+                    prefetcht1(ptr[reg_aux_C + C_offset(0, ld)]);
+                }
+                add(reg_aux_C, brg.typesize_C * brg.LDC);
+            }
             for (int bd = bd_b; bd < bd_e; bd++) {
                 if (!is_emdbd) {
                     const auto bd_by_load_bytes
@@ -1553,8 +1587,16 @@ void jit_brgemm_kernel_t::gemm_microkernel_avx512(int bd_block2,
                                     || brg.brgattr.wary_tail_read);
                     broadcast(bcst(), A_offset(bd, rd),
                             have_to_load_bytes && bd_by_load_bytes);
+                    if (brg.brgattr.hint_prefetching == brgemm_kernel_prefetching_t::brgemm_prf_ac && rd == 0) {
+                        if (is_rd_tail || is_rd_last_col) {
+                            prefetcht0(ptr[reg_aux_A + A_offset(bd, rd) +
+                                bdb_A_offset(bd_block2) - 64 * (reduce_num_in_cache_lines - prefetch_num)]);
+                        } else {
+                            prefetcht0(ptr[reg_aux_A + A_offset(bd, rd) + 64 * prefetch_num]);
+                        }
+                    }
                 }
-                if (prefetch_count_B < ld_block2) {
+                if (brg.brgattr.hint_prefetching == brgemm_kernel_prefetching_t::brgemm_prf_default && prefetch_count_B < ld_block2) {
                     prefetcht0(ptr[reg_aux_B + B_offset(prefetch_count_B++, rd)
                             + brg.LDB * brg.rd_block * brg.typesize_B]);
                 }
@@ -1589,6 +1631,11 @@ void jit_brgemm_kernel_t::ldb_loop(int bd_block2, bool is_bdb_tail,
         const auto bd_e = nstl::min(bd_block, bd_block + vpad);
         if (bd_b >= bd_e) return;
 
+        const int reduce_num_in_cache_lines = div_up(brg.reduce_dim * brg.typesize_A, 64);
+        int prefetch_num = std::min(8, reduce_num_in_cache_lines);
+        auto n = std::getenv("USE_P");
+        if (n) prefetch_num = n[0] - '0';
+
         if (brg.is_amx) {
             const bool is_rd_tail = false;
             gemm_microkernel_amx(
@@ -1596,20 +1643,56 @@ void jit_brgemm_kernel_t::ldb_loop(int bd_block2, bool is_bdb_tail,
         } else {
             if (brg.rdb > 0) {
                 Label rdb_loop_label;
-                mov(reg_rdb_loop, brg.rdb);
-                L_aligned(rdb_loop_label, 64);
-                {
+                Label rdb_loop_label_tail;
+                if (brg.brgattr.hint_prefetching == brgemm_kernel_prefetching_t::brgemm_prf_ac) {
+                    if (brg.rdb > (prefetch_num - (brg.rdb_tail != 0))) {
+                        mov(reg_rdb_loop, brg.rdb - (prefetch_num - (brg.rdb_tail != 0)));
+                        L_aligned(rdb_loop_label, 64);
+                        {
+                            const bool is_rd_tail = false;
+                            gemm_microkernel_avx512(bd_block2, is_bdb_tail, ld_block2,
+                                    is_rd_tail, is_ld_tail, vpad, rows_for_rd_tail, false, prefetch_num);
+
+                            add(reg_aux_A, rdb_A_offset());
+                            add(reg_aux_B, rdb_B_offset());
+
+                            dec(reg_rdb_loop);
+                            cmp(reg_rdb_loop, 0);
+                        }
+                        jg(rdb_loop_label, T_NEAR);
+                    }
+                } else {
+                    mov(reg_rdb_loop, brg.rdb);
+                    L_aligned(rdb_loop_label, 64);
+                    {
+                        const bool is_rd_tail = false;
+                        gemm_microkernel_avx512(bd_block2, is_bdb_tail, ld_block2,
+                                is_rd_tail, is_ld_tail, vpad, rows_for_rd_tail, false, prefetch_num);
+
+                        add(reg_aux_A, rdb_A_offset());
+                        add(reg_aux_B, rdb_B_offset());
+
+                        dec(reg_rdb_loop);
+                        cmp(reg_rdb_loop, 0);
+                    }
+                    jg(rdb_loop_label, T_NEAR);
+                }
+                if (brg.brgattr.hint_prefetching == brgemm_kernel_prefetching_t::brgemm_prf_ac) {
                     const bool is_rd_tail = false;
+                    mov(reg_rdb_loop, prefetch_num - (brg.rdb_tail != 0));
+                    push(reg_aux_C);
+                    L_aligned(rdb_loop_label_tail, 64);
                     gemm_microkernel_avx512(bd_block2, is_bdb_tail, ld_block2,
-                            is_rd_tail, is_ld_tail, vpad, rows_for_rd_tail);
+                            is_rd_tail, is_ld_tail, vpad, rows_for_rd_tail, true, prefetch_num);
 
                     add(reg_aux_A, rdb_A_offset());
                     add(reg_aux_B, rdb_B_offset());
-
                     dec(reg_rdb_loop);
                     cmp(reg_rdb_loop, 0);
+                    jg(rdb_loop_label_tail, T_NEAR);
+                    if (brg.rdb_tail == 0)
+                        pop(reg_aux_C);
                 }
-                jg(rdb_loop_label, T_NEAR);
             }
         }
         if (brg.rdb_tail != 0) {
@@ -1619,7 +1702,9 @@ void jit_brgemm_kernel_t::ldb_loop(int bd_block2, bool is_bdb_tail,
                         is_rd_tail, is_ld_tail);
             } else {
                 gemm_microkernel_avx512(bd_block2, is_bdb_tail, ld_block2,
-                        is_rd_tail, is_ld_tail, vpad, rows_for_rd_tail);
+                        is_rd_tail, is_ld_tail, vpad, rows_for_rd_tail, false, prefetch_num);
+                if (brg.brgattr.hint_prefetching == brgemm_kernel_prefetching_t::brgemm_prf_ac)
+                    pop(reg_aux_C);
             }
         }
     };
@@ -1957,7 +2042,10 @@ void jit_brgemm_kernel_t::generate() {
     sub(rsp, stack_space_needed_);
 
     const auto full_mask = size_t {0xffffffffffffffff};
-    const auto tail_mask = size_t((1 << brg.ldb_tail) - 1);
+    auto tail_mask = size_t((1 << brg.ldb_tail) - 1);
+    if (brg.no_N_tail) {
+        tail_mask = size_t((1 << (brg.load_dim % brg.ld_block)) - 1);
+    }
 
     vpad_exist
             = (brg.brgattr.max_top_vpad > 0 || brg.brgattr.max_bottom_vpad > 0)

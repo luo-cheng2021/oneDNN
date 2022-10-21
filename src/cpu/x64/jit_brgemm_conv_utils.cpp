@@ -1175,9 +1175,11 @@ bool brg_blocking_t::fast_check_oc_block_1x1() const {
         const auto big_spatial
                 = od * oh * ow >= 64 * stride_d * stride_h * stride_w;
         res = (rnd_oc % oc_block == 0 && big_spatial);
-    } else if (oc_block == 48) {
-        const auto oc_block_eff = static_cast<float>(oc) / rnd_up(oc, oc_block);
-        res = (oc_block_eff >= 0.95);
+    // if oc_block is not close to 48 we still hope to use 48 because only handle tail oc
+    //   will bring a seperate loop which will degradte performance in brgemm kernel
+    //} else if (oc_block == 48) {
+    //    const auto oc_block_eff = static_cast<float>(oc) / rnd_up(oc, oc_block);
+    //    res = (oc_block_eff >= 0.95);
     } else
         res = true;
 
@@ -2121,6 +2123,16 @@ status_t init_1x1_conf(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     jcp.use_uker = is_amx(isa);
     if (jcp.use_uker)
         jcp.hint_prefetching = brgemm_kernel_prefetching_t::brgemm_prf_output1;
+    else {
+        if (jcp.ic >= 16 * 8) {
+            jcp.hint_prefetching = brgemm_kernel_prefetching_t::brgemm_prf_ac;
+        }
+        auto p = std::getenv("USE_BRG");
+        if (p) {
+            jcp.hint_prefetching = p[0] == '1' ? brgemm_kernel_prefetching_t::brgemm_prf_ac:
+                brgemm_kernel_prefetching_t::brgemm_prf_default;
+        }
+    }
     CHECK(pick_tags(jcp, src_md, weights_md, dst_md, bias_md));
     CHECK(attr.set_default_formats(&dst_md));
 
